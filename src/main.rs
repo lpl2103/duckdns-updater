@@ -10,7 +10,7 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("DuckDNS Updater")
-            .with_inner_size([480.0, 440.0])
+            .with_inner_size([520.0, 440.0])
             .with_resizable(false)
             .with_icon(load_app_icon()),
         ..Default::default()

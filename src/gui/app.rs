@@ -348,7 +348,7 @@ impl eframe::App for DuckDnsApp {
             ui.add_space(15.0);
             ui.horizontal(|ui| {
                 if ui
-                    .add_sized([130.0, 30.0], egui::Button::new("💾 Salvar Settings"))
+                    .add_sized([110.0, 30.0], egui::Button::new("💾 Salvar Settings"))
                     .clicked()
                 {
                     self.save_settings();
@@ -356,7 +356,7 @@ impl eframe::App for DuckDnsApp {
 
                 if ui
                     .add_sized(
-                        [140.0, 30.0],
+                        [130.0, 30.0],
                         egui::Button::new("⚡ Forçar Atualização"),
                     )
                     .clicked()
@@ -366,12 +366,22 @@ impl eframe::App for DuckDnsApp {
 
                 if ui
                     .add_sized(
-                        [130.0, 30.0],
-                        egui::Button::new("📌 Ocultar p/ Tray"),
+                        [110.0, 30.0],
+                        egui::Button::new("📌 Ocultar Tray"),
                     )
                     .clicked()
                 {
                     hide_main_window(&self.window_visible);
+                }
+
+                if ui
+                    .add_sized(
+                        [90.0, 30.0],
+                        egui::Button::new("❌ Fechar App"),
+                    )
+                    .clicked()
+                {
+                    std::process::exit(0);
                 }
             });
         });
