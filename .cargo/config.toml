@@ -1,2 +1,2 @@
-[build]
-target = "x86_64-pc-windows-gnu"
+# Target is inherited from the default toolchain (x86_64-pc-windows-gnu)
+# so builds go directly to target/debug/ and target/release/

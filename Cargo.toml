@@ -15,9 +15,12 @@ chrono = "0.4"
 dirs = "5.0"
 tray-icon = "0.19"
 notify-rust = "4.11"
+image = { version = "0.25", default-features = false, features = ["ico", "png"] }
+
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", features = ["winuser", "winnt"] }
+winreg = "0.55"
 
 
 [profile.release]
@@ -27,4 +30,5 @@ codegen-units = 1
 strip = true
 
 [build-dependencies]
-winres = "0.1.12"
+winres = "0.1"
+
