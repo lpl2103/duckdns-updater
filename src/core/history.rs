@@ -1,5 +1,7 @@
 use crate::core::config::AppConfig;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
+use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::path::PathBuf;
 
@@ -45,8 +47,13 @@ impl UpdateHistory {
         let path = Self::get_path();
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| format!("Falha ao serializar histórico: {}", e))?;
-        fs::write(&path, json)
-            .map_err(|e| format!("Falha ao salvar histórico: {}", e))
+
+        // Gravação atômica via arquivo temporário
+        let tmp_path = path.with_extension("json.tmp");
+        fs::write(&tmp_path, json)
+            .map_err(|e| format!("Falha ao gravar arquivo temporário de histórico: {}", e))?;
+        fs::rename(&tmp_path, &path)
+            .map_err(|e| format!("Falha ao substituir arquivo de histórico: {}", e))
     }
 
     pub fn add_entry(&mut self, entry: HistoryEntry) {
@@ -60,11 +67,18 @@ impl UpdateHistory {
     }
 
     /// Export entries as CSV content string.
+    ///
+    /// Uses `writeln!` into the pre-allocated `String` to avoid intermediate
+    /// allocations per row.
     pub fn export_csv(&self) -> String {
-        let mut csv = String::from("Data/Hora,Domínios,IPv4 Anterior,IPv4 Novo,IPv6 Anterior,IPv6 Novo,Status,Mensagem\n");
+        let header = "Data/Hora,Domínios,IPv4 Anterior,IPv4 Novo,IPv6 Anterior,IPv6 Novo,Status,Mensagem\n";
+        let mut csv = String::with_capacity(self.entries.len() * 128 + header.len());
+        csv.push_str(header);
         for e in &self.entries {
-            csv.push_str(&format!(
-                "{},{},{},{},{},{},{},{}\n",
+            // `writeln!` into String never errors.
+            let _ = writeln!(
+                csv,
+                "{},{},{},{},{},{},{},{}",
                 Self::csv_escape(&e.timestamp),
                 Self::csv_escape(&e.domains),
                 Self::csv_escape(e.old_ipv4.as_deref().unwrap_or("")),
@@ -73,7 +87,7 @@ impl UpdateHistory {
                 Self::csv_escape(e.new_ipv6.as_deref().unwrap_or("")),
                 if e.success { "OK" } else { "FALHA" },
                 Self::csv_escape(&e.message),
-            ));
+            );
         }
         csv
     }
@@ -83,16 +97,19 @@ impl UpdateHistory {
         let mut path = AppConfig::get_config_dir();
         path.push("duckdns_history_export.csv");
         let csv = self.export_csv();
-        fs::write(&path, csv)
-            .map_err(|e| format!("Falha ao exportar CSV: {}", e))?;
+        fs::write(&path, csv).map_err(|e| format!("Falha ao exportar CSV: {}", e))?;
         Ok(path)
     }
 
-    fn csv_escape(s: &str) -> String {
+    /// RFC 4180-compliant CSV cell escaping.
+    ///
+    /// Returns a `Cow::Borrowed` (zero-copy) for the common case where no
+    /// quoting is needed, and `Cow::Owned` only when the cell must be quoted.
+    fn csv_escape(s: &str) -> Cow<'_, str> {
         if s.contains(',') || s.contains('"') || s.contains('\n') {
-            format!("\"{}\"", s.replace('"', "\"\""))
+            Cow::Owned(format!("\"{}\"", s.replace('"', "\"\"")))
         } else {
-            s.to_string()
+            Cow::Borrowed(s)
         }
     }
 }

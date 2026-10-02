@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::fs;
 use std::path::PathBuf;
 
@@ -31,6 +32,23 @@ pub struct AppConfig {
     /// Enable IPv6 address detection and update.
     #[serde(default = "default_true")]
     pub ipv6_enabled: bool,
+
+    // ── Webhook fields ──────────────────────────────────────────────────────
+    /// Discord Webhook URL for update notifications.
+    #[serde(default)]
+    pub discord_webhook: String,
+
+    /// Telegram Bot Token for update notifications.
+    #[serde(default)]
+    pub telegram_bot_token: String,
+
+    /// Telegram Chat ID to receive update notifications.
+    #[serde(default)]
+    pub telegram_chat_id: String,
+
+    /// Notify Windows toasts and webhooks only when IP actually changes.
+    #[serde(default)]
+    pub notify_on_change_only: bool,
 }
 
 fn default_true() -> bool {
@@ -51,13 +69,18 @@ impl Default for AppConfig {
             start_with_windows: false,
             start_minimized: false,
             ipv6_enabled: true,
+            discord_webhook: String::new(),
+            telegram_bot_token: String::new(),
+            telegram_chat_id: String::new(),
+            notify_on_change_only: false,
         }
     }
 }
 
 impl AppConfig {
     pub fn get_config_dir() -> PathBuf {
-        if let Some(mut dir) = dirs::config_dir() {
+        if let Some(appdata) = std::env::var_os("APPDATA") {
+            let mut dir = PathBuf::from(appdata);
             dir.push("duckdns-updater");
             let _ = fs::create_dir_all(&dir);
             return dir;
@@ -91,6 +114,10 @@ impl AppConfig {
                         .filter(|s| !s.is_empty())
                         .collect();
                 }
+                // ── Decrypt credentials with Windows DPAPI if protected ────
+                config.token = crate::core::crypto::decrypt_string(&config.token);
+                config.discord_webhook = crate::core::crypto::decrypt_string(&config.discord_webhook);
+                config.telegram_bot_token = crate::core::crypto::decrypt_string(&config.telegram_bot_token);
                 return config;
             }
         }
@@ -98,19 +125,37 @@ impl AppConfig {
     }
 
     /// Returns the comma-joined domain string for the DuckDNS API.
-    pub fn domains_csv(&self) -> String {
+    ///
+    /// Uses `Cow` to avoid allocating when there is only a single domain
+    /// (the common case) and the legacy `domain` field is already a `String`.
+    pub fn domains_csv(&self) -> Cow<'_, str> {
         if self.domains.is_empty() {
-            self.domain.clone()
+            // Borrow the legacy field directly — zero allocation.
+            Cow::Borrowed(&self.domain)
+        } else if self.domains.len() == 1 {
+            // Single domain — borrow without joining.
+            Cow::Borrowed(&self.domains[0])
         } else {
-            self.domains.join(",")
+            // Multiple domains — must allocate to join.
+            Cow::Owned(self.domains.join(","))
         }
     }
 
     pub fn save(&self) -> Result<(), String> {
         let path = Self::get_config_path();
-        let json = serde_json::to_string_pretty(self)
+        let mut save_copy = self.clone();
+        save_copy.token = crate::core::crypto::encrypt_string(&self.token);
+        save_copy.discord_webhook = crate::core::crypto::encrypt_string(&self.discord_webhook);
+        save_copy.telegram_bot_token = crate::core::crypto::encrypt_string(&self.telegram_bot_token);
+
+        let json = serde_json::to_string_pretty(&save_copy)
             .map_err(|e| format!("Falha ao serializar configuração: {}", e))?;
-        fs::write(&path, json)
-            .map_err(|e| format!("Falha ao salvar arquivo de configuração: {}", e))
+
+        // Gravação atômica via arquivo temporário
+        let tmp_path = path.with_extension("json.tmp");
+        fs::write(&tmp_path, json)
+            .map_err(|e| format!("Falha ao gravar arquivo temporário de configuração: {}", e))?;
+        fs::rename(&tmp_path, &path)
+            .map_err(|e| format!("Falha ao substituir arquivo de configuração: {}", e))
     }
 }

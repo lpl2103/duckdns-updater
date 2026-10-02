@@ -1,5 +1,12 @@
+# Target directory do Rust
 /target
-*.exe
+
+# Arquivos temporários e backups de auto-atualização
+*.old
+*.new
+*.tmp
+*.bak
 assets/*.o
 assets/*.rc
-
+.vscode/
+.idea/

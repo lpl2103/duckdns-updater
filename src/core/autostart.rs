@@ -1,8 +1,8 @@
-/// Windows Registry auto-start management.
-///
-/// Registers/unregisters the current executable in
-/// `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`
-/// so the app launches automatically when the user logs in.
+//! Windows Registry auto-start management.
+//!
+//! Registers/unregisters the current executable in
+//! `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`
+//! so the app launches automatically when the user logs in.
 
 #[cfg(target_os = "windows")]
 use winreg::enums::*;
@@ -26,8 +26,9 @@ pub fn set_autostart(enabled: bool) -> Result<(), String> {
         if enabled {
             let exe_path = std::env::current_exe()
                 .map_err(|e| format!("Falha ao obter caminho do executável: {}", e))?;
+            let cmd = format!("\"{}\" --minimized", exe_path.display());
             run_key
-                .set_value(APP_NAME, &exe_path.to_string_lossy().to_string())
+                .set_value(APP_NAME, &cmd)
                 .map_err(|e| format!("Falha ao definir valor no Registry: {}", e))?;
         } else {
             // Ignore error if the value doesn't exist

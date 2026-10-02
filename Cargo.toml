@@ -1,9 +1,9 @@
 [package]
 name = "duckdns-updater"
-version = "1.0.0"
+version = "1.2.0"
 edition = "2021"
-authors = ["DuckDNS Updater Team"]
-description = "Fast, lightweight cross-platform DuckDNS Dynamic DNS updater with GUI and System Tray"
+authors = ["Leandro Pinheiro <engenharia@duckdns-updater.local>"]
+description = "Atualizador nativo de IP público para DuckDNS com WinUI 3 Fluent Dark, Multi-Domínio, Auto-Start e Auto-Updater"
 
 [dependencies]
 eframe = "0.29"
@@ -11,11 +11,10 @@ egui = "0.29"
 ureq = { version = "2.10", features = ["json"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-chrono = "0.4"
-dirs = "5.0"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 tray-icon = "0.19"
 notify-rust = "4.11"
-image = { version = "0.25", default-features = false, features = ["ico", "png"] }
+base64 = "0.22"
 
 
 [target.'cfg(windows)'.dependencies]
@@ -24,11 +23,13 @@ winreg = "0.55"
 
 
 [profile.release]
-opt-level = 3
-lto = "thin"
+opt-level = "z"
+lto = true
 codegen-units = 1
+panic = "abort"
 strip = true
 
 [build-dependencies]
-winres = "0.1"
+embed-resource = "2"
+image = { version = "0.25", default-features = false, features = ["ico", "png"] }
 

@@ -5,6 +5,7 @@ use super::config::AppConfig;
 
 #[derive(Debug, Clone)]
 pub struct UpdateResult {
+    #[allow(dead_code)]
     pub success: bool,
     pub ipv4: Option<String>,
     pub ipv6: Option<String>,
@@ -29,31 +30,55 @@ impl DuckDnsService {
         Self { agent }
     }
 
-    /// Fetch the current public IPv4 address.
+    /// Fetch the current public IPv4 address with multi-provider fallback.
     pub fn get_public_ipv4(&self) -> Option<String> {
-        self.agent
-            .get("https://api.ipify.org")
-            .call()
-            .ok()
-            .and_then(|r| r.into_string().ok())
-            .map(|s| s.trim().to_string())
+        let providers = [
+            "https://api.ipify.org",
+            "https://icanhazip.com",
+            "https://ident.me",
+            "https://ifconfig.me/ip",
+            "https://checkip.amazonaws.com",
+        ];
+
+        for url in providers {
+            if let Ok(resp) = self.agent.get(url).call() {
+                if let Ok(text) = resp.into_string() {
+                    let clean = text.trim();
+                    if clean.parse::<std::net::Ipv4Addr>().is_ok() {
+                        return Some(clean.to_string());
+                    }
+                }
+            }
+        }
+        None
     }
 
-    /// Fetch the current public IPv6 address.
+    /// Fetch the current public IPv6 address with multi-provider fallback.
     pub fn get_public_ipv6(&self) -> Option<String> {
-        self.agent
-            .get("https://api6.ipify.org")
-            .call()
-            .ok()
-            .and_then(|r| r.into_string().ok())
-            .map(|s| s.trim().to_string())
+        let providers = [
+            "https://api6.ipify.org",
+            "https://ipv6.icanhazip.com",
+            "https://v6.ident.me",
+        ];
+
+        for url in providers {
+            if let Ok(resp) = self.agent.get(url).call() {
+                if let Ok(text) = resp.into_string() {
+                    let clean = text.trim();
+                    if clean.parse::<std::net::Ipv6Addr>().is_ok() {
+                        return Some(clean.to_string());
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Perform an update with smart IP change detection, IPv6 toggle, and
     /// multi-domain support. Retries with exponential backoff on failure.
     pub fn update(&self, config: &AppConfig) -> Result<UpdateResult, String> {
-        let domains = config.domains_csv();
-        let domains = domains.trim();
+        let domains_owned = config.domains_csv();
+        let domains = domains_owned.trim();
         let token = config.token.trim();
 
         if domains.is_empty() {
@@ -148,5 +173,11 @@ impl DuckDnsService {
             .map_err(|e| format!("Erro ao ler resposta: {}", e))?;
 
         Ok(response)
+    }
+}
+
+impl Default for DuckDnsService {
+    fn default() -> Self {
+        Self::new()
     }
 }

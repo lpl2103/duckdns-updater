@@ -19,14 +19,30 @@ pub enum UiUpdateMsg {
     Finished {
         success: bool,
         message: String,
+        #[allow(dead_code)]
         ip_changed: bool,
+        /// IPs captured **before** saving to config, for accurate history.
+        old_ipv4: Option<String>,
+        old_ipv6: Option<String>,
+        new_ipv4: Option<String>,
+        new_ipv6: Option<String>,
     },
+    /// Tray thread requests the window to be shown.
+    ShowWindow,
+    /// Notificação de progresso da atualização do executável
+    AppUpdateProgress(crate::core::updater::UpdateStatus),
+    /// Resultado da verificação de propagação DNS via DoH
+    DnsCheckResult(crate::core::dns::DnsCheckResult),
+    /// Resultado do teste de disparo de Webhook (Discord / Telegram)
+    WebhookTestResult(Result<String, String>),
 }
 
 pub struct DuckDnsApp {
     config: AppConfig,
     /// Editable multi-domain string in the UI (comma-separated).
     domains_edit: String,
+    /// Editable interval string — kept in app state to avoid allocating every frame.
+    interval_edit: String,
     service: Arc<DuckDnsService>,
     status_message: String,
     is_updating: bool,
@@ -36,11 +52,11 @@ pub struct DuckDnsApp {
     /// Shared flag: true = window is shown on screen.
     window_visible: Arc<AtomicBool>,
     /// Set by background threads after saving new results to disk.
+    /// Writers use `Release`, reader (UI thread) uses `Acquire`.
     config_dirty: Arc<AtomicBool>,
     /// Shared flag: network connectivity status.
     network_online: Arc<AtomicBool>,
 
-    // ── New fields ─────────────────────────────────────────────────────────
     history: UpdateHistory,
     last_update_instant: Option<Instant>,
     show_history_panel: bool,
@@ -48,6 +64,26 @@ pub struct DuckDnsApp {
     success_flash_alpha: f32,
     /// Cached autostart state from Registry.
     autostart_enabled: bool,
+
+    /// Nova versão remota disponível encontrada
+    available_app_update: Arc<std::sync::Mutex<Option<crate::core::updater::RemoteVersionInfo>>>,
+    /// Status do processo de auto-update
+    app_update_status: crate::core::updater::UpdateStatus,
+    /// Modal de notificação de atualização
+    show_app_update_modal: bool,
+    /// Se já exibiu o prompt de atualização inicial
+    has_prompted_app_update: bool,
+
+    /// Estado da verificação de propagação DNS via DoH
+    is_checking_dns: bool,
+    dns_check_result: Option<crate::core::dns::DnsCheckResult>,
+
+    /// Estado do teste de Webhooks externos
+    is_testing_webhook: bool,
+    webhook_test_result: Option<Result<String, String>>,
+
+    /// Feedback temporário de cópia para área de transferência ("Copiado!")
+    copied_toast: Option<(String, Instant)>,
 }
 
 impl DuckDnsApp {
@@ -60,6 +96,7 @@ impl DuckDnsApp {
         } else {
             config.domains.join(", ")
         };
+        let interval_edit = config.interval_minutes.to_string();
 
         let service = Arc::new(DuckDnsService::new());
         let (tx, rx) = channel::<UiUpdateMsg>();
@@ -72,8 +109,9 @@ impl DuckDnsApp {
         let service_tray = service.clone();
         let config_dirty_tray = config_dirty.clone();
         let window_visible_tray = window_visible.clone();
+        let tx_tray = tx.clone();
 
-        thread::Builder::new()
+        let _ = thread::Builder::new()
             .name("tray-pump".into())
             .spawn(move || {
                 loop {
@@ -98,14 +136,17 @@ impl DuckDnsApp {
 
                     while let Ok(ev) = MenuEvent::receiver().try_recv() {
                         if Some(&ev.id) == open_id.as_ref() {
-                            show_main_window(&window_visible_tray);
+                            // Signal the egui thread to show the window safely.
+                            let _ = tx_tray.send(UiUpdateMsg::ShowWindow);
                         } else if Some(&ev.id) == force_id.as_ref() {
                             let svc = service_tray.clone();
                             let dirty = config_dirty_tray.clone();
                             let vis = window_visible_tray.clone();
-                            thread::spawn(move || {
-                                run_tray_update(&svc, &dirty, &vis);
-                            });
+                            let _ = thread::Builder::new()
+                                .name("tray-force-update".into())
+                                .spawn(move || {
+                                    run_tray_update(&svc, &dirty, &vis);
+                                });
                         } else if Some(&ev.id) == exit_id.as_ref() {
                             std::process::exit(0);
                         }
@@ -113,22 +154,23 @@ impl DuckDnsApp {
 
                     thread::sleep(Duration::from_millis(50));
                 }
-            })
-            .expect("failed to spawn tray-pump thread");
+            });
 
         // ── Auto-update background thread ───────────────────────────────────
         let service_auto = service.clone();
         let config_dirty_auto = config_dirty.clone();
         let window_visible_auto = window_visible.clone();
 
-        thread::Builder::new()
+        let _ = thread::Builder::new()
             .name("auto-update".into())
             .spawn(move || {
                 loop {
-                    let cfg = AppConfig::load();
-                    let interval = cfg.interval_minutes.max(1) as u64;
+                    // First load: read interval only.
+                    let interval_cfg = AppConfig::load();
+                    let interval = interval_cfg.interval_minutes.max(1) as u64;
                     thread::sleep(Duration::from_secs(interval * 60));
 
+                    // Second load: get fresh config after sleeping.
                     let cfg = AppConfig::load();
                     if cfg.update_enabled
                         && !cfg.domains_csv().is_empty()
@@ -142,27 +184,50 @@ impl DuckDnsApp {
                         );
                     }
                 }
-            })
-            .expect("failed to spawn auto-update thread");
+            });
 
         // ── Network status background thread ────────────────────────────────
+        // The `Agent` is created once here and reused for all connectivity
+        // checks, preserving its internal connection pool.
         let network_online = Arc::new(AtomicBool::new(true));
         let network_online_thread = network_online.clone();
-        thread::Builder::new()
+        let _ = thread::Builder::new()
             .name("network-check".into())
-            .spawn(move || loop {
-                let is_up = check_internet_connection();
-                network_online_thread.store(is_up, Ordering::Relaxed);
-                thread::sleep(Duration::from_secs(10));
-            })
-            .expect("failed to spawn network-check thread");
+            .spawn(move || {
+                let agent = ureq::AgentBuilder::new()
+                    .timeout_connect(Duration::from_secs(2))
+                    .timeout(Duration::from_secs(3))
+                    .build();
+                loop {
+                    let is_up = agent.get("https://www.duckdns.org").call().is_ok()
+                        || agent.get("https://1.1.1.1").call().is_ok();
+                    network_online_thread.store(is_up, Ordering::Relaxed);
+                    thread::sleep(Duration::from_secs(10));
+                }
+            });
 
         let history = UpdateHistory::load();
         let autostart_enabled = autostart::is_autostart_enabled();
 
+        let available_app_update = Arc::new(std::sync::Mutex::new(None));
+        let available_app_update_bg = Arc::clone(&available_app_update);
+        let egui_ctx_bg = cc.egui_ctx.clone();
+
+        // Checagem assíncrona de nova versão no GitHub ao iniciar
+        let _ = thread::Builder::new()
+            .name("github-update-check".into())
+            .spawn(move || {
+                if let Some(info) = crate::core::updater::check_for_updates() {
+                    let mut lock = available_app_update_bg.lock().unwrap_or_else(|e| e.into_inner());
+                    *lock = Some(info);
+                    egui_ctx_bg.request_repaint();
+                }
+            });
+
         let app = Self {
             config,
             domains_edit,
+            interval_edit,
             service,
             status_message: "Pronto.".to_string(),
             is_updating: false,
@@ -178,6 +243,15 @@ impl DuckDnsApp {
             show_about_dialog: false,
             success_flash_alpha: 0.0,
             autostart_enabled,
+            available_app_update,
+            app_update_status: crate::core::updater::UpdateStatus::Idle,
+            show_app_update_modal: false,
+            has_prompted_app_update: false,
+            is_checking_dns: false,
+            dns_check_result: None,
+            is_testing_webhook: false,
+            webhook_test_result: None,
+            copied_toast: None,
         };
 
         if app.config.update_enabled
@@ -190,6 +264,95 @@ impl DuckDnsApp {
         app
     }
 
+    /// Inicia o download e substituição a quente do binário do aplicativo
+    fn trigger_app_auto_update(&mut self) {
+        let download_url = self
+            .available_app_update
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|info| info.download_url.clone());
+
+        self.app_update_status = crate::core::updater::UpdateStatus::Downloading(0.0);
+        let tx = self.tx.clone();
+
+        let spawn_res = thread::Builder::new()
+            .name("app-auto-updater".into())
+            .spawn(move || {
+                let tx_progress = tx.clone();
+                let res = crate::core::updater::perform_auto_update(download_url, move |status| {
+                    let _ = tx_progress.send(UiUpdateMsg::AppUpdateProgress(status));
+                });
+
+                if let Err(e) = res {
+                    let _ = tx.send(UiUpdateMsg::AppUpdateProgress(
+                        crate::core::updater::UpdateStatus::Error(e),
+                    ));
+                }
+            });
+
+        if let Err(e) = spawn_res {
+            self.app_update_status = crate::core::updater::UpdateStatus::Error(format!(
+                "Falha ao iniciar processo de atualização: {}",
+                e
+            ));
+        }
+    }
+
+    /// Executa teste de resolução DNS via DoH em background
+    fn trigger_dns_check(&mut self) {
+        if self.is_checking_dns {
+            return;
+        }
+        let domain = self
+            .config
+            .domains
+            .first()
+            .cloned()
+            .unwrap_or_else(|| self.config.domain.clone());
+
+        if domain.trim().is_empty() {
+            self.dns_check_result = Some(crate::core::dns::DnsCheckResult {
+                fqdn: "N/A".to_string(),
+                resolved_ip: None,
+                expected_ip: None,
+                is_propagated: false,
+                error: Some("Configure um domínio antes de testar a resolução DNS.".to_string()),
+            });
+            return;
+        }
+
+        self.is_checking_dns = true;
+        self.dns_check_result = None;
+        let expected_ip = self.config.last_ipv4.clone();
+        let tx = self.tx.clone();
+
+        let _ = thread::Builder::new()
+            .name("dns-check".into())
+            .spawn(move || {
+                let res = crate::core::dns::check_dns_propagation(&domain, expected_ip.as_deref());
+                let _ = tx.send(UiUpdateMsg::DnsCheckResult(res));
+            });
+    }
+
+    /// Dispara teste de envio de Webhook (Discord / Telegram) em background
+    fn trigger_webhook_test(&mut self) {
+        if self.is_testing_webhook {
+            return;
+        }
+        self.is_testing_webhook = true;
+        self.webhook_test_result = None;
+        let config = self.config.clone();
+        let tx = self.tx.clone();
+
+        let _ = thread::Builder::new()
+            .name("webhook-test".into())
+            .spawn(move || {
+                let res = crate::core::webhook::test_webhook(&config);
+                let _ = tx.send(UiUpdateMsg::WebhookTestResult(res));
+            });
+    }
+
     /// Trigger an update from the GUI buttons.
     fn trigger_ui_update(&self) {
         if self.is_updating {
@@ -199,42 +362,105 @@ impl DuckDnsApp {
         let config = self.config.clone();
         let service = self.service.clone();
         let tx = self.tx.clone();
+        let tx_thread = tx.clone();
 
         let _ = tx.send(UiUpdateMsg::Started);
 
-        thread::spawn(move || {
-            match service.update(&config) {
-                Ok(result) => {
-                    let mut cfg = config;
-                    cfg.last_update =
-                        Some(Local::now().format("%Y-%m-%d %H:%M:%S").to_string());
-                    cfg.last_ipv4 = result.ipv4.clone();
-                    if cfg.ipv6_enabled {
-                        cfg.last_ipv6 = result.ipv6.clone();
-                    }
-                    let _ = cfg.save();
+        let spawn_res = thread::Builder::new()
+            .name("ui-update".into())
+            .spawn(move || {
+                // Capture old IPs BEFORE the update so history is accurate.
+                let old_ipv4 = config.last_ipv4.clone();
+                let old_ipv6 = config.last_ipv6.clone();
 
-                    let msg = format!(
-                        "Atualizado! IPv4: {} | IPv6: {}",
-                        result.ipv4.as_deref().unwrap_or("N/A"),
-                        result.ipv6.as_deref().unwrap_or("N/A"),
-                    );
-                    let _ = tx.send(UiUpdateMsg::Finished {
-                        success: true,
-                        message: msg,
-                        ip_changed: result.ip_changed,
-                    });
+                match service.update(&config) {
+                    Ok(result) => {
+                        let mut cfg = config.clone();
+                        cfg.last_update =
+                            Some(Local::now().format("%Y-%m-%d %H:%M:%S").to_string());
+                        cfg.last_ipv4 = result.ipv4.clone();
+                        if cfg.ipv6_enabled {
+                            cfg.last_ipv6 = result.ipv6.clone();
+                        }
+                        let _ = cfg.save();
+
+                        // Dispara notificações Webhook se configuradas
+                        if !config.notify_on_change_only || result.ip_changed {
+                            let event = crate::core::webhook::WebhookEvent {
+                                domains: config.domains_csv().into_owned(),
+                                old_ipv4: old_ipv4.clone(),
+                                new_ipv4: result.ipv4.clone(),
+                                old_ipv6: old_ipv6.clone(),
+                                new_ipv6: result.ipv6.clone(),
+                                success: true,
+                                message: "IP público atualizado com sucesso!".to_string(),
+                                timestamp: Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+                            };
+                            let cfg_notif = config;
+                            let _ = thread::Builder::new()
+                                .name("webhook-ui-notify".into())
+                                .spawn(move || {
+                                    crate::core::webhook::send_notifications(&cfg_notif, &event);
+                                });
+                        }
+
+                        let msg = format!(
+                            "Atualizado! IPv4: {} | IPv6: {}",
+                            result.ipv4.as_deref().unwrap_or("N/A"),
+                            result.ipv6.as_deref().unwrap_or("N/A"),
+                        );
+                        let _ = tx_thread.send(UiUpdateMsg::Finished {
+                            success: true,
+                            message: msg,
+                            ip_changed: result.ip_changed,
+                            old_ipv4,
+                            old_ipv6,
+                            new_ipv4: result.ipv4,
+                            new_ipv6: result.ipv6,
+                        });
+                    }
+                    Err(err) => {
+                        let event = crate::core::webhook::WebhookEvent {
+                            domains: config.domains_csv().into_owned(),
+                            old_ipv4: old_ipv4.clone(),
+                            new_ipv4: None,
+                            old_ipv6: old_ipv6.clone(),
+                            new_ipv6: None,
+                            success: false,
+                            message: format!("Falha: {}", err),
+                            timestamp: Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+                        };
+                        let cfg_notif = config;
+                        let _ = thread::Builder::new()
+                            .name("webhook-ui-notify-err".into())
+                            .spawn(move || {
+                                crate::core::webhook::send_notifications(&cfg_notif, &event);
+                            });
+
+                        let _ = tx_thread.send(UiUpdateMsg::Finished {
+                            success: false,
+                            message: format!("Falha: {}", err),
+                            ip_changed: false,
+                            old_ipv4,
+                            old_ipv6,
+                            new_ipv4: None,
+                            new_ipv6: None,
+                        });
+                    }
                 }
-                Err(err) => {
-                    let msg = format!("Falha: {}", err);
-                    let _ = tx.send(UiUpdateMsg::Finished {
-                        success: false,
-                        message: msg,
-                        ip_changed: false,
-                    });
-                }
-            }
-        });
+            });
+
+        if let Err(e) = spawn_res {
+            let _ = tx.send(UiUpdateMsg::Finished {
+                success: false,
+                message: format!("Falha ao iniciar thread: {}", e),
+                ip_changed: false,
+                old_ipv4: None,
+                old_ipv6: None,
+                new_ipv4: None,
+                new_ipv6: None,
+            });
+        }
     }
 
     fn save_settings(&mut self) {
@@ -246,7 +472,12 @@ impl DuckDnsApp {
             .filter(|s| !s.is_empty())
             .collect();
         // Keep legacy field in sync
-        self.config.domain = self.config.domains_csv();
+        self.config.domain = self.config.domains_csv().into_owned();
+
+        // Sync interval from edit string
+        if let Ok(v) = self.interval_edit.parse::<u32>() {
+            self.config.interval_minutes = v;
+        }
 
         // Handle autostart toggle
         if self.config.start_with_windows != self.autostart_enabled {
@@ -272,38 +503,20 @@ impl DuckDnsApp {
         }
     }
 
-    /// Validate config fields; returns list of error messages.
-    fn validate(&self) -> Vec<String> {
+    /// Validate config fields; returns list of error messages (zero heap allocation).
+    fn validate(&self) -> Vec<&'static str> {
         let mut errors = Vec::new();
-        let domains: Vec<&str> = self.domains_edit.split(',')
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .collect();
-        if domains.is_empty() {
-            errors.push("Domínio não pode estar vazio.".into());
+        let has_domain = self.domains_edit.split(',').any(|s| !s.trim().is_empty());
+        if !has_domain {
+            errors.push("Domínio não pode estar vazio.");
         }
         if self.config.token.trim().is_empty() {
-            errors.push("Token não pode estar vazio.".into());
+            errors.push("Token não pode estar vazio.");
         }
         if self.config.interval_minutes < 1 {
-            errors.push("Intervalo deve ser >= 1 minuto.".into());
+            errors.push("Intervalo deve ser >= 1 minuto.");
         }
         errors
-    }
-
-    /// Record an update result in the history.
-    fn record_history(&mut self, success: bool, message: &str) {
-        let entry = HistoryEntry {
-            timestamp: Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
-            domains: self.config.domains_csv(),
-            old_ipv4: self.config.last_ipv4.clone(),
-            new_ipv4: self.config.last_ipv4.clone(),
-            old_ipv6: self.config.last_ipv6.clone(),
-            new_ipv6: self.config.last_ipv6.clone(),
-            success,
-            message: message.to_string(),
-        };
-        self.history.add_entry(entry);
     }
 }
 
@@ -313,7 +526,9 @@ impl eframe::App for DuckDnsApp {
         ctx.request_repaint_after(Duration::from_secs(1));
 
         // ── Reload config if a background thread saved new data ─────────────
-        if self.config_dirty.swap(false, Ordering::Relaxed) {
+        // Use Acquire ordering so all writes made before the Release store in
+        // the background thread are guaranteed to be visible here.
+        if self.config_dirty.swap(false, Ordering::Acquire) {
             let old_ipv4 = self.config.last_ipv4.clone();
             let old_ipv6 = self.config.last_ipv6.clone();
             self.config = AppConfig::load();
@@ -328,7 +543,7 @@ impl eframe::App for DuckDnsApp {
             // Record in history from background update
             let entry = HistoryEntry {
                 timestamp: self.config.last_update.clone().unwrap_or_default(),
-                domains: self.config.domains_csv(),
+                domains: self.config.domains_csv().into_owned(),
                 old_ipv4,
                 new_ipv4: self.config.last_ipv4.clone(),
                 old_ipv6,
@@ -339,15 +554,17 @@ impl eframe::App for DuckDnsApp {
             self.history.add_entry(entry);
         }
 
-        // ── Intercept close ('X') → hide via Win32 API ─────────────────────
+        // ── Intercept close ('X') → hide via egui viewport command ─────────
         if ctx.input(|i| i.viewport().close_requested()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            hide_main_window(&self.window_visible);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            self.window_visible.store(false, Ordering::Relaxed);
         }
 
-        // ── Intercept OS minimise → hide via Win32 API ─────────────────────
+        // ── Intercept OS minimise → hide via egui viewport command ──────────
         if ctx.input(|i| i.viewport().minimized.unwrap_or(false)) {
-            hide_main_window(&self.window_visible);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            self.window_visible.store(false, Ordering::Relaxed);
         }
 
         // ── Keyboard shortcuts ─────────────────────────────────────────────
@@ -359,7 +576,8 @@ impl eframe::App for DuckDnsApp {
             self.trigger_ui_update();
         }
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            hide_main_window(&self.window_visible);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            self.window_visible.store(false, Ordering::Relaxed);
         }
 
         // ── Drain UI update channel ─────────────────────────────────────────
@@ -373,9 +591,26 @@ impl eframe::App for DuckDnsApp {
                     success,
                     message,
                     ip_changed: _,
+                    old_ipv4,
+                    old_ipv6,
+                    new_ipv4,
+                    new_ipv6,
                 } => {
                     self.is_updating = false;
-                    self.record_history(success, &message);
+
+                    // Record history with correct old vs new IPs.
+                    let entry = HistoryEntry {
+                        timestamp: Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+                        domains: self.config.domains_csv().into_owned(),
+                        old_ipv4,
+                        new_ipv4,
+                        old_ipv6,
+                        new_ipv6,
+                        success,
+                        message: message.clone(),
+                    };
+                    self.history.add_entry(entry);
+
                     self.status_message = message;
                     if success {
                         self.config = AppConfig::load();
@@ -383,6 +618,116 @@ impl eframe::App for DuckDnsApp {
                         self.success_flash_alpha = 1.0;
                     }
                 }
+                UiUpdateMsg::ShowWindow => {
+                    // Restore window using egui's safe viewport API — no
+                    // unsafe Win32 FindWindowW required.
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    self.window_visible.store(true, Ordering::Relaxed);
+                }
+                UiUpdateMsg::AppUpdateProgress(status) => {
+                    self.app_update_status = status;
+                }
+                UiUpdateMsg::DnsCheckResult(res) => {
+                    self.is_checking_dns = false;
+                    self.dns_check_result = Some(res);
+                }
+                UiUpdateMsg::WebhookTestResult(res) => {
+                    self.is_testing_webhook = false;
+                    self.webhook_test_result = Some(res);
+                }
+            }
+        }
+
+        // ── Toast de cópia temporário (expira em 2 segundos) ───────────────
+        if let Some((_, instant)) = &self.copied_toast {
+            if instant.elapsed() > Duration::from_secs(2) {
+                self.copied_toast = None;
+            }
+        }
+
+        // ── Prompt automático de atualização ────────────────────────────────
+        if !self.has_prompted_app_update {
+            let lock = self.available_app_update.lock().unwrap_or_else(|e| e.into_inner());
+            if lock.is_some() {
+                self.show_app_update_modal = true;
+                self.has_prompted_app_update = true;
+            }
+        }
+
+        // ── Modal de Notificação de Nova Versão ─────────────────────────────
+        if self.show_app_update_modal {
+            let available = self.available_app_update.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            if let Some(info) = available {
+                egui::Window::new("Atualização do DuckDNS Updater")
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                    .show(ctx, |ui| {
+                        ui.set_width(360.0);
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(4.0);
+                            ui.heading(
+                                egui::RichText::new("Nova Atualização Disponível!")
+                                    .color(egui::Color32::from_rgb(0, 120, 212))
+                                    .strong(),
+                            );
+                            ui.add_space(6.0);
+                            ui.label("Uma nova versão do DuckDNS Updater foi lançada no GitHub.");
+                            ui.add_space(8.0);
+
+                            ui.group(|ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label("Versão Instalada:");
+                                    ui.label(
+                                        egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
+                                            .monospace()
+                                            .weak(),
+                                    );
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("Nova Versão:");
+                                    ui.label(
+                                        egui::RichText::new(format!("v{}", info.version))
+                                            .monospace()
+                                            .strong()
+                                            .color(egui::Color32::from_rgb(46, 204, 113)),
+                                    );
+                                });
+                            });
+
+                            if !info.release_notes.is_empty() {
+                                ui.add_space(6.0);
+                                ui.label(
+                                    egui::RichText::new(&info.release_notes)
+                                        .small()
+                                        .italics()
+                                        .color(egui::Color32::from_rgb(180, 180, 180)),
+                                );
+                            }
+
+                            ui.add_space(12.0);
+                            ui.horizontal(|ui| {
+                                let btn_update = egui::Button::new(
+                                    egui::RichText::new("Atualizar Agora")
+                                        .strong()
+                                        .color(egui::Color32::WHITE),
+                                )
+                                .fill(egui::Color32::from_rgb(0, 120, 212));
+
+                                if ui.add(btn_update).clicked() {
+                                    self.show_app_update_modal = false;
+                                    self.show_about_dialog = true;
+                                    self.trigger_app_auto_update();
+                                }
+
+                                if ui.button("Mais Tarde").clicked() {
+                                    self.show_app_update_modal = false;
+                                }
+                            });
+                            ui.add_space(4.0);
+                        });
+                    });
             }
         }
 
@@ -391,15 +736,21 @@ impl eframe::App for DuckDnsApp {
             self.success_flash_alpha = (self.success_flash_alpha - 0.02).max(0.0);
         }
 
-        // ── About Dialog ────────────────────────────────────────────────────
+        // ── About Dialog & Auto-Updater ─────────────────────────────────────
         if self.show_about_dialog {
-            egui::Window::new("Sobre")
+            let available = self.available_app_update.lock().unwrap_or_else(|e| e.into_inner()).clone();
+
+            egui::Window::new("Sobre e Atualizações")
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
-                    ui.vertical_centered(|ui| {
-                        ui.add_space(8.0);
+                    ui.set_width(410.0);
+                    egui::ScrollArea::vertical()
+                        .max_height(460.0)
+                        .show(ui, |ui| {
+                            ui.vertical_centered(|ui| {
+                        ui.add_space(6.0);
                         ui.label(
                             egui::RichText::new("DuckDNS Updater")
                                 .size(20.0)
@@ -407,14 +758,13 @@ impl eframe::App for DuckDnsApp {
                                 .color(egui::Color32::WHITE),
                         );
                         ui.label(
-                            egui::RichText::new("v1.1.0")
+                            egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
                                 .size(13.0)
                                 .color(egui::Color32::from_rgb(0, 120, 212)),
                         );
-                        ui.add_space(8.0);
-                        ui.label("Atualizador de DNS dinâmico para DuckDNS.");
-                        ui.label("Nativo, leve e seguro.");
-                        ui.add_space(8.0);
+                        ui.add_space(6.0);
+                        ui.label("Atualizador nativo e leve de DNS dinâmico para DuckDNS.");
+                        ui.add_space(6.0);
                         ui.label(
                             egui::RichText::new("Desenvolvido por Leandro Pinheiro")
                                 .strong()
@@ -425,13 +775,258 @@ impl eframe::App for DuckDnsApp {
                                 .size(11.0)
                                 .color(egui::Color32::from_rgb(0, 120, 212)),
                         );
-                        ui.add_space(8.0);
+                        ui.add_space(6.0);
                         ui.hyperlink_to("duckdns.org", "https://www.duckdns.org");
-                        ui.add_space(8.0);
+                    });
+
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(6.0);
+
+                    // ── Opções do Aplicativo ────────────────────────────────────────
+                    ui.label(
+                        egui::RichText::new("Opções do Aplicativo")
+                            .strong()
+                            .size(13.0),
+                    );
+                    ui.add_space(4.0);
+
+                    ui.group(|ui| {
+                        if ui
+                            .checkbox(
+                                &mut self.config.update_enabled,
+                                "Ativar atualização automática periódica",
+                            )
+                            .changed()
+                        {
+                            let _ = self.config.save();
+                        }
+                        if ui
+                            .checkbox(&mut self.config.ipv6_enabled, "Ativar IPv6")
+                            .changed()
+                        {
+                            let _ = self.config.save();
+                        }
+                        if ui
+                            .checkbox(
+                                &mut self.config.start_with_windows,
+                                "Iniciar com o Windows",
+                            )
+                            .changed()
+                        {
+                            if let Err(e) = autostart::set_autostart(self.config.start_with_windows) {
+                                self.status_message = format!("Erro ao configurar auto-start: {}", e);
+                                self.config.start_with_windows = self.autostart_enabled;
+                            } else {
+                                self.autostart_enabled = self.config.start_with_windows;
+                                let _ = self.config.save();
+                            }
+                        }
+                        if ui
+                            .checkbox(
+                                &mut self.config.start_minimized,
+                                "Iniciar minimizado na tray",
+                            )
+                            .changed()
+                        {
+                            let _ = self.config.save();
+                        }
+                        if ui
+                            .checkbox(
+                                &mut self.config.notify_on_change_only,
+                                "Notificar apenas quando o IP mudar",
+                            )
+                            .changed()
+                        {
+                            let _ = self.config.save();
+                        }
+                    });
+
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(6.0);
+
+                    // ── Notificações Externas (Webhooks) ───────────────────────────
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("Notificações Externas (Webhooks)")
+                                .strong()
+                                .size(13.0),
+                        );
+                        ui.label(
+                            egui::RichText::new("🔒 Protegido com DPAPI")
+                                .size(10.0)
+                                .color(egui::Color32::from_rgb(46, 204, 113)),
+                        );
+                    });
+                    ui.add_space(4.0);
+
+                    ui.group(|ui| {
+                        ui.label(egui::RichText::new("Discord Webhook URL:").size(12.0));
+                        let d_resp = ui.add(
+                            egui::TextEdit::singleline(&mut self.config.discord_webhook)
+                                .password(true)
+                                .hint_text("https://discord.com/api/webhooks/..."),
+                        );
+                        if d_resp.changed() {
+                            let _ = self.config.save();
+                        }
+
+                        ui.add_space(4.0);
+                        ui.label(egui::RichText::new("Telegram Bot Token:").size(12.0));
+                        let t_resp = ui.add(
+                            egui::TextEdit::singleline(&mut self.config.telegram_bot_token)
+                                .password(true)
+                                .hint_text("Token do bot (ex: 123456789:ABCdefGh...)"),
+                        );
+                        if t_resp.changed() {
+                            let _ = self.config.save();
+                        }
+
+                        ui.add_space(4.0);
+                        ui.label(egui::RichText::new("Telegram Chat ID:").size(12.0));
+                        let c_resp = ui.add(
+                            egui::TextEdit::singleline(&mut self.config.telegram_chat_id)
+                                .hint_text("Chat ID (ex: 987654321 ou -100123456789)"),
+                        );
+                        if c_resp.changed() {
+                            let _ = self.config.save();
+                        }
+
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            let test_btn = egui::Button::new("🔔 Testar Webhook");
+                            if ui.add_enabled(!self.is_testing_webhook, test_btn).clicked() {
+                                self.trigger_webhook_test();
+                            }
+                            if self.is_testing_webhook {
+                                ui.spinner();
+                                ui.label(egui::RichText::new("Enviando...").small().weak());
+                            }
+                        });
+
+                        if let Some(res) = &self.webhook_test_result {
+                            ui.add_space(2.0);
+                            match res {
+                                Ok(msg) => {
+                                    ui.label(
+                                        egui::RichText::new(format!("✓ {}", msg))
+                                            .size(11.0)
+                                            .color(egui::Color32::from_rgb(46, 204, 113)),
+                                    );
+                                }
+                                Err(err) => {
+                                    ui.label(
+                                        egui::RichText::new(format!("⚠ {}", err))
+                                            .size(11.0)
+                                            .color(egui::Color32::from_rgb(231, 76, 60)),
+                                    );
+                                }
+                            }
+                        }
+                    });
+
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(6.0);
+
+                    ui.label(
+                        egui::RichText::new("Atualização do Aplicativo")
+                            .strong()
+                            .size(13.0),
+                    );
+                    ui.add_space(4.0);
+
+                    ui.group(|ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("Versão Instalada:");
+                            ui.label(
+                                egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
+                                    .monospace()
+                                    .strong(),
+                            );
+                        });
+
+                        if let Some(ref info) = available {
+                            ui.horizontal(|ui| {
+                                ui.label("Versão no GitHub:");
+                                ui.label(
+                                    egui::RichText::new(format!("v{}", info.version))
+                                        .monospace()
+                                        .strong()
+                                        .color(egui::Color32::from_rgb(46, 204, 113)),
+                                );
+                            });
+                        } else {
+                            ui.horizontal(|ui| {
+                                ui.label("Status:");
+                                ui.label(
+                                    egui::RichText::new("Você está na versão mais recente.")
+                                        .small()
+                                        .color(egui::Color32::from_rgb(46, 204, 113)),
+                                );
+                            });
+                        }
+                    });
+
+                    ui.add_space(8.0);
+
+                    match &self.app_update_status {
+                        crate::core::updater::UpdateStatus::Idle => {
+                            if let Some(ref info) = available {
+                                let btn_update = egui::Button::new(
+                                    egui::RichText::new(format!("Baixar e Atualizar para v{}", info.version))
+                                        .strong()
+                                        .color(egui::Color32::WHITE),
+                                )
+                                .fill(egui::Color32::from_rgb(0, 120, 212));
+
+                                if ui.add(btn_update).clicked() {
+                                    self.trigger_app_auto_update();
+                                }
+                            } else if ui.button("Verificar Novamente").clicked() {
+                                let available_bg = Arc::clone(&self.available_app_update);
+                                let egui_ctx = ctx.clone();
+                                thread::spawn(move || {
+                                    if let Some(info) = crate::core::updater::check_for_updates() {
+                                        let mut lock = available_bg.lock().unwrap_or_else(|e| e.into_inner());
+                                        *lock = Some(info);
+                                    }
+                                    egui_ctx.request_repaint();
+                                });
+                            }
+                        }
+                        crate::core::updater::UpdateStatus::Downloading(progress) => {
+                            ui.label(format!("Baixando nova versão... ({:.0}%)", progress * 100.0));
+                            ui.add(egui::ProgressBar::new(*progress).animate(true));
+                        }
+                        crate::core::updater::UpdateStatus::Success(msg) => {
+                            ui.label(
+                                egui::RichText::new(msg)
+                                    .color(egui::Color32::from_rgb(46, 204, 113))
+                                    .strong(),
+                            );
+                        }
+                        crate::core::updater::UpdateStatus::Error(err) => {
+                            ui.label(
+                                egui::RichText::new(format!("Erro ao atualizar: {}", err))
+                                    .color(egui::Color32::from_rgb(231, 76, 60))
+                                    .small(),
+                            );
+                            ui.add_space(4.0);
+                            if ui.button("Tentar Novamente").clicked() {
+                                self.trigger_app_auto_update();
+                            }
+                        }
+                    }
+
+                    }); // end ScrollArea
+
+                    ui.add_space(8.0);
+                    ui.vertical_centered(|ui| {
                         if ui.button("Fechar").clicked() {
                             self.show_about_dialog = false;
                         }
-
                     });
                 });
         }
@@ -456,13 +1051,16 @@ impl eframe::App for DuckDnsApp {
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
-                        .add(egui::Button::new(
-                            egui::RichText::new("?")
-                                .size(14.0)
-                                .strong()
-                                .color(egui::Color32::from_rgb(160, 160, 160)),
-                        ).min_size(egui::vec2(28.0, 28.0)))
-                        .on_hover_text("Sobre o aplicativo")
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new("⚙ Sobre")
+                                    .size(12.0)
+                                    .strong()
+                                    .color(egui::Color32::from_rgb(180, 180, 180)),
+                            )
+                            .min_size(egui::vec2(32.0, 26.0)),
+                        )
+                        .on_hover_text("Sobre o aplicativo e opções")
                         .clicked()
                     {
                         self.show_about_dialog = !self.show_about_dialog;
@@ -598,13 +1196,10 @@ impl eframe::App for DuckDnsApp {
                         let interval_err = validation_errors
                             .iter()
                             .any(|e| e.contains("Intervalo"));
-                        let mut interval_str =
-                            self.config.interval_minutes.to_string();
-                        let resp = ui.add(
-                            egui::TextEdit::singleline(&mut interval_str),
-                        );
+                        // `interval_edit` lives in app state — no per-frame allocation.
+                        let resp = ui.add(egui::TextEdit::singleline(&mut self.interval_edit));
                         if resp.changed() {
-                            if let Ok(v) = interval_str.parse::<u32>() {
+                            if let Ok(v) = self.interval_edit.parse::<u32>() {
                                 self.config.interval_minutes = v;
                             }
                         }
@@ -629,21 +1224,6 @@ impl eframe::App for DuckDnsApp {
                         );
                     }
                 }
-
-                ui.add_space(8.0);
-                ui.checkbox(
-                    &mut self.config.update_enabled,
-                    "Ativar atualização automática periódica",
-                );
-                ui.checkbox(&mut self.config.ipv6_enabled, "Ativar IPv6");
-                ui.checkbox(
-                    &mut self.config.start_with_windows,
-                    "Iniciar com o Windows",
-                );
-                ui.checkbox(
-                    &mut self.config.start_minimized,
-                    "Iniciar minimizado na tray",
-                );
             });
 
             ui.add_space(6.0);
@@ -689,23 +1269,80 @@ impl eframe::App for DuckDnsApp {
 
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("Último IPv4:").weak());
-                    ui.label(
-                        egui::RichText::new(
-                            self.config.last_ipv4.as_deref().unwrap_or("N/A"),
-                        )
-                        .monospace(),
-                    );
+                    let ipv4_str = self.config.last_ipv4.as_deref().unwrap_or("N/A");
+                    ui.label(egui::RichText::new(ipv4_str).monospace().strong());
+                    if let Some(ip) = &self.config.last_ipv4 {
+                        if ui.small_button("📋").on_hover_text("Copiar IPv4 para área de transferência").clicked() {
+                            ui.output_mut(|o| o.copied_text = ip.clone());
+                            self.copied_toast = Some(("IPv4 copiado!".to_string(), Instant::now()));
+                        }
+                    }
                 });
 
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("Último IPv6:").weak());
-                    ui.label(
-                        egui::RichText::new(
-                            self.config.last_ipv6.as_deref().unwrap_or("N/A"),
-                        )
-                        .monospace(),
-                    );
+                    let ipv6_str = self.config.last_ipv6.as_deref().unwrap_or("N/A");
+                    ui.label(egui::RichText::new(ipv6_str).monospace());
+                    if let Some(ip) = &self.config.last_ipv6 {
+                        if ui.small_button("📋").on_hover_text("Copiar IPv6 para área de transferência").clicked() {
+                            ui.output_mut(|o| o.copied_text = ip.clone());
+                            self.copied_toast = Some(("IPv6 copiado!".to_string(), Instant::now()));
+                        }
+                    }
                 });
+
+                if let Some((msg, _)) = &self.copied_toast {
+                    ui.label(
+                        egui::RichText::new(format!("  ✓ {}", msg))
+                            .size(11.0)
+                            .color(egui::Color32::from_rgb(46, 204, 113)),
+                    );
+                }
+
+                ui.add_space(3.0);
+                ui.horizontal(|ui| {
+                    let dns_btn = egui::Button::new("🔍 Testar Resolução DNS (DoH)");
+                    if ui.add_enabled(!self.is_checking_dns, dns_btn).clicked() {
+                        self.trigger_dns_check();
+                    }
+                    if self.is_checking_dns {
+                        ui.spinner();
+                        ui.label(egui::RichText::new("Consultando DoH...").small().weak());
+                    }
+                });
+
+                if let Some(res) = &self.dns_check_result {
+                    ui.add_space(2.0);
+                    if let Some(err) = &res.error {
+                        ui.label(
+                            egui::RichText::new(format!("⚠ {}", err))
+                                .size(11.0)
+                                .color(egui::Color32::from_rgb(231, 76, 60)),
+                        );
+                    } else if res.is_propagated {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "✓ {} ➔ {} (Propagado!)",
+                                res.fqdn,
+                                res.resolved_ip.as_deref().unwrap_or("N/A")
+                            ))
+                            .size(11.0)
+                            .color(egui::Color32::from_rgb(46, 204, 113))
+                            .strong(),
+                        );
+                    } else {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "⏳ {} ➔ {} (Aguardando propagação, esperado: {})",
+                                res.fqdn,
+                                res.resolved_ip.as_deref().unwrap_or("N/A"),
+                                res.expected_ip.as_deref().unwrap_or("N/A")
+                            ))
+                            .size(11.0)
+                            .color(egui::Color32::from_rgb(241, 196, 15)),
+                        );
+                    }
+                }
 
                 // ── Countdown Timer ─────────────────────────────────────
                 if self.config.update_enabled {
@@ -804,7 +1441,8 @@ impl eframe::App for DuckDnsApp {
                     )
                     .clicked()
                 {
-                    hide_main_window(&self.window_visible);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                    self.window_visible.store(false, Ordering::Relaxed);
                 }
 
                 let hist_label = if self.show_history_panel {
@@ -820,6 +1458,11 @@ impl eframe::App for DuckDnsApp {
                     .clicked()
                 {
                     self.show_history_panel = !self.show_history_panel;
+                    if self.show_history_panel {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(490.0, 750.0)));
+                    } else {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(490.0, 560.0)));
+                    }
                 }
             });
 
@@ -924,20 +1567,15 @@ impl eframe::App for DuckDnsApp {
                                                 .size(11.0)
                                                 .monospace(),
                                             );
-                                            let (icon, color) = if entry.success
-                                            {
+                                            let (icon, color) = if entry.success {
                                                 (
                                                     "OK",
-                                                    egui::Color32::from_rgb(
-                                                        46, 204, 113,
-                                                    ),
+                                                    egui::Color32::from_rgb(46, 204, 113),
                                                 )
                                             } else {
                                                 (
                                                     "FALHA",
-                                                    egui::Color32::from_rgb(
-                                                        231, 76, 60,
-                                                    ),
+                                                    egui::Color32::from_rgb(231, 76, 60),
                                                 )
                                             };
                                             ui.label(
@@ -957,40 +1595,6 @@ impl eframe::App for DuckDnsApp {
             }); // end ScrollArea
         });
     }
-}
-
-// ─── Win32 window management ────────────────────────────────────────────────────
-
-/// Hide the main window using the Win32 API.
-fn hide_main_window(visible_flag: &AtomicBool) {
-    #[cfg(target_os = "windows")]
-    unsafe {
-        use winapi::um::winuser::{FindWindowW, ShowWindow, SW_HIDE};
-        let title: Vec<u16> = "DuckDNS Updater\0".encode_utf16().collect();
-        let hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
-        if !hwnd.is_null() {
-            ShowWindow(hwnd, SW_HIDE);
-        }
-    }
-    visible_flag.store(false, Ordering::Relaxed);
-}
-
-/// Restore and focus the main window using the Win32 API.
-fn show_main_window(visible_flag: &AtomicBool) {
-    #[cfg(target_os = "windows")]
-    unsafe {
-        use winapi::um::winuser::{
-            FindWindowW, SetForegroundWindow, ShowWindow, SW_RESTORE, SW_SHOW,
-        };
-        let title: Vec<u16> = "DuckDNS Updater\0".encode_utf16().collect();
-        let hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
-        if !hwnd.is_null() {
-            ShowWindow(hwnd, SW_SHOW);
-            ShowWindow(hwnd, SW_RESTORE);
-            SetForegroundWindow(hwnd);
-        }
-    }
-    visible_flag.store(true, Ordering::Relaxed);
 }
 
 // ─── Background update logic ────────────────────────────────────────────────────
@@ -1035,16 +1639,35 @@ fn run_background_update(
                 cfg.last_ipv6 = result.ipv6.clone();
             }
             let _ = cfg.save();
-            config_dirty.store(true, Ordering::Relaxed);
+            // Release ordering: all writes above (save to disk) must be
+            // visible to the UI thread before it reads `config_dirty`.
+            config_dirty.store(true, Ordering::Release);
 
-            let body = format!(
-                "Atualizado com sucesso!\nIPv4: {}\nIPv6: {}",
-                result.ipv4.as_deref().unwrap_or("N/A"),
-                result.ipv6.as_deref().unwrap_or("N/A"),
-            );
+            if !config.notify_on_change_only || result.ip_changed {
+                let body = format!(
+                    "Atualizado com sucesso!\nIPv4: {}\nIPv6: {}",
+                    result.ipv4.as_deref().unwrap_or("N/A"),
+                    result.ipv6.as_deref().unwrap_or("N/A"),
+                );
+                notify_if_hidden(window_visible, "DuckDNS Updater", &body);
 
-            // Only notify on IP change or always when hidden
-            notify_if_hidden(window_visible, "DuckDNS Updater", &body);
+                let event = crate::core::webhook::WebhookEvent {
+                    domains: config.domains_csv().into_owned(),
+                    old_ipv4: config.last_ipv4.clone(),
+                    new_ipv4: result.ipv4.clone(),
+                    old_ipv6: config.last_ipv6.clone(),
+                    new_ipv6: result.ipv6.clone(),
+                    success: true,
+                    message: "Atualização em segundo plano concluída com sucesso!".to_string(),
+                    timestamp: Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+                };
+                let cfg_clone = config.clone();
+                let _ = thread::Builder::new()
+                    .name("webhook-bg-notify".into())
+                    .spawn(move || {
+                        crate::core::webhook::send_notifications(&cfg_clone, &event);
+                    });
+            }
         }
         Err(err) => {
             notify_if_hidden(
@@ -1052,6 +1675,23 @@ fn run_background_update(
                 "DuckDNS Updater - Erro",
                 &format!("Falha na atualização: {}", err),
             );
+
+            let event = crate::core::webhook::WebhookEvent {
+                domains: config.domains_csv().into_owned(),
+                old_ipv4: config.last_ipv4.clone(),
+                new_ipv4: None,
+                old_ipv6: config.last_ipv6.clone(),
+                new_ipv6: None,
+                success: false,
+                message: format!("Falha na atualização em segundo plano: {}", err),
+                timestamp: Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+            };
+            let cfg_clone = config.clone();
+            let _ = thread::Builder::new()
+                .name("webhook-bg-notify-err".into())
+                .spawn(move || {
+                    crate::core::webhook::send_notifications(&cfg_clone, &event);
+                });
         }
     }
 }
@@ -1075,35 +1715,10 @@ fn create_tray() -> (
     Option<tray_icon::menu::MenuId>,
     Option<tray_icon::menu::MenuId>,
 ) {
-    let icon_bytes = include_bytes!("../../assets/icon.ico");
-    let icon = match image::load_from_memory(icon_bytes) {
-        Ok(img) => {
-            let rgba = img.to_rgba8();
-            let (w, h) = rgba.dimensions();
-            tray_icon::Icon::from_rgba(rgba.into_raw(), w, h).ok()
-        }
-        Err(_) => {
-            const W: u32 = 32;
-            const H: u32 = 32;
-            let mut rgba = Vec::with_capacity((W * H * 4) as usize);
-            for y in 0..H {
-                for x in 0..W {
-                    let dx = x as f32 - 15.5;
-                    let dy = y as f32 - 15.5;
-                    if dx * dx + dy * dy <= 14.0 * 14.0 {
-                        rgba.extend_from_slice(&[20, 140, 220, 255]);
-                    } else {
-                        rgba.extend_from_slice(&[0, 0, 0, 0]);
-                    }
-                }
-            }
-            tray_icon::Icon::from_rgba(rgba, W, H).ok()
-        }
-    };
-
-    let icon = match icon {
-        Some(i) => i,
-        None => return (None, None, None, None),
+    const RAW_RGBA: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/icon_32.rgba"));
+    let icon = match tray_icon::Icon::from_rgba(RAW_RGBA.to_vec(), 32, 32) {
+        Ok(i) => i,
+        Err(_) => return (None, None, None, None),
     };
 
     let open_item = MenuItem::new("Abrir Configurações", true, None);
@@ -1127,15 +1742,6 @@ fn create_tray() -> (
         .ok();
 
     (tray_icon, Some(open_id), Some(force_id), Some(exit_id))
-}
-
-fn check_internet_connection() -> bool {
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(2))
-        .timeout(Duration::from_secs(3))
-        .build();
-    agent.get("https://www.duckdns.org").call().is_ok()
-        || agent.get("https://1.1.1.1").call().is_ok()
 }
 
 fn apply_winui3_theme(ctx: &egui::Context) {
@@ -1174,19 +1780,27 @@ fn apply_winui3_theme(ctx: &egui::Context) {
 
     ctx.set_visuals(visuals);
 
+    // Load Segoe UI at runtime (Windows only) so:
+    //   1. Compilation works on non-Windows hosts.
+    //   2. The font is NOT baked into the binary (keeps binary smaller).
+    //   3. If the font is missing, egui silently falls back to its built-in font.
     let mut fonts = egui::FontDefinitions::default();
-    fonts.font_data.insert(
-        "segoe_ui".to_owned(),
-        egui::FontData::from_static(include_bytes!(
-            "C:\\Windows\\Fonts\\segoeui.ttf"
-        )),
-    );
 
-    fonts
-        .families
-        .entry(egui::FontFamily::Proportional)
-        .or_default()
-        .insert(0, "segoe_ui".to_owned());
+    #[cfg(target_os = "windows")]
+    {
+        let font_path = std::path::Path::new(r"C:\Windows\Fonts\segoeui.ttf");
+        if let Ok(bytes) = std::fs::read(font_path) {
+            fonts.font_data.insert(
+                "segoe_ui".to_owned(),
+                egui::FontData::from_owned(bytes),
+            );
+            fonts
+                .families
+                .entry(egui::FontFamily::Proportional)
+                .or_default()
+                .insert(0, "segoe_ui".to_owned());
+        }
+    }
 
     ctx.set_fonts(fonts);
 }

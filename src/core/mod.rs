@@ -1,4 +1,8 @@
 pub mod autostart;
 pub mod config;
+pub mod crypto;
+pub mod dns;
 pub mod duckdns;
 pub mod history;
+pub mod updater;
+pub mod webhook;
