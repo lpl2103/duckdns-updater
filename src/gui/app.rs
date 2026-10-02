@@ -854,7 +854,7 @@ impl eframe::App for DuckDnsApp {
                                 .size(13.0),
                         );
                         ui.label(
-                            egui::RichText::new("🔒 Protegido com DPAPI")
+                            egui::RichText::new("[DPAPI] Protegido")
                                 .size(10.0)
                                 .color(egui::Color32::from_rgb(46, 204, 113)),
                         );
@@ -895,7 +895,7 @@ impl eframe::App for DuckDnsApp {
 
                         ui.add_space(6.0);
                         ui.horizontal(|ui| {
-                            let test_btn = egui::Button::new("🔔 Testar Webhook");
+                            let test_btn = egui::Button::new("Testar Webhook");
                             if ui.add_enabled(!self.is_testing_webhook, test_btn).clicked() {
                                 self.trigger_webhook_test();
                             }
@@ -910,14 +910,15 @@ impl eframe::App for DuckDnsApp {
                             match res {
                                 Ok(msg) => {
                                     ui.label(
-                                        egui::RichText::new(format!("✓ {}", msg))
+                                        egui::RichText::new(format!("[OK] {}", msg))
                                             .size(11.0)
-                                            .color(egui::Color32::from_rgb(46, 204, 113)),
+                                            .color(egui::Color32::from_rgb(46, 204, 113))
+                                            .strong(),
                                     );
                                 }
                                 Err(err) => {
                                     ui.label(
-                                        egui::RichText::new(format!("⚠ {}", err))
+                                        egui::RichText::new(format!("[!] {}", err))
                                             .size(11.0)
                                             .color(egui::Color32::from_rgb(231, 76, 60)),
                                     );
@@ -1218,7 +1219,7 @@ impl eframe::App for DuckDnsApp {
                     ui.add_space(4.0);
                     for err in &validation_errors {
                         ui.label(
-                            egui::RichText::new(format!("  ⚠ {}", err))
+                            egui::RichText::new(format!("  [!] {}", err))
                                 .size(11.0)
                                 .color(egui::Color32::from_rgb(231, 76, 60)),
                         );
@@ -1272,7 +1273,7 @@ impl eframe::App for DuckDnsApp {
                     let ipv4_str = self.config.last_ipv4.as_deref().unwrap_or("N/A");
                     ui.label(egui::RichText::new(ipv4_str).monospace().strong());
                     if let Some(ip) = &self.config.last_ipv4 {
-                        if ui.small_button("📋").on_hover_text("Copiar IPv4 para área de transferência").clicked() {
+                        if ui.small_button("Copiar").on_hover_text("Copiar IPv4 para área de transferência").clicked() {
                             ui.output_mut(|o| o.copied_text = ip.clone());
                             self.copied_toast = Some(("IPv4 copiado!".to_string(), Instant::now()));
                         }
@@ -1284,7 +1285,7 @@ impl eframe::App for DuckDnsApp {
                     let ipv6_str = self.config.last_ipv6.as_deref().unwrap_or("N/A");
                     ui.label(egui::RichText::new(ipv6_str).monospace());
                     if let Some(ip) = &self.config.last_ipv6 {
-                        if ui.small_button("📋").on_hover_text("Copiar IPv6 para área de transferência").clicked() {
+                        if ui.small_button("Copiar").on_hover_text("Copiar IPv6 para área de transferência").clicked() {
                             ui.output_mut(|o| o.copied_text = ip.clone());
                             self.copied_toast = Some(("IPv6 copiado!".to_string(), Instant::now()));
                         }
@@ -1293,15 +1294,16 @@ impl eframe::App for DuckDnsApp {
 
                 if let Some((msg, _)) = &self.copied_toast {
                     ui.label(
-                        egui::RichText::new(format!("  ✓ {}", msg))
+                        egui::RichText::new(format!("  [OK] {}", msg))
                             .size(11.0)
-                            .color(egui::Color32::from_rgb(46, 204, 113)),
+                            .color(egui::Color32::from_rgb(46, 204, 113))
+                            .strong(),
                     );
                 }
 
                 ui.add_space(3.0);
                 ui.horizontal(|ui| {
-                    let dns_btn = egui::Button::new("🔍 Testar Resolução DNS (DoH)");
+                    let dns_btn = egui::Button::new("Testar Resolução DNS (DoH)");
                     if ui.add_enabled(!self.is_checking_dns, dns_btn).clicked() {
                         self.trigger_dns_check();
                     }
@@ -1315,14 +1317,14 @@ impl eframe::App for DuckDnsApp {
                     ui.add_space(2.0);
                     if let Some(err) = &res.error {
                         ui.label(
-                            egui::RichText::new(format!("⚠ {}", err))
+                            egui::RichText::new(format!("[!] {}", err))
                                 .size(11.0)
                                 .color(egui::Color32::from_rgb(231, 76, 60)),
                         );
                     } else if res.is_propagated {
                         ui.label(
                             egui::RichText::new(format!(
-                                "✓ {} ➔ {} (Propagado!)",
+                                "[OK] {} -> {} (Propagado!)",
                                 res.fqdn,
                                 res.resolved_ip.as_deref().unwrap_or("N/A")
                             ))
@@ -1333,7 +1335,7 @@ impl eframe::App for DuckDnsApp {
                     } else {
                         ui.label(
                             egui::RichText::new(format!(
-                                "⏳ {} ➔ {} (Aguardando propagação, esperado: {})",
+                                "[Aguardando] {} -> {} (Esperado: {})",
                                 res.fqdn,
                                 res.resolved_ip.as_deref().unwrap_or("N/A"),
                                 res.expected_ip.as_deref().unwrap_or("N/A")
@@ -1799,6 +1801,24 @@ fn apply_winui3_theme(ctx: &egui::Context) {
                 .entry(egui::FontFamily::Proportional)
                 .or_default()
                 .insert(0, "segoe_ui".to_owned());
+        }
+
+        let symbol_path = std::path::Path::new(r"C:\Windows\Fonts\seguisym.ttf");
+        if let Ok(bytes) = std::fs::read(symbol_path) {
+            fonts.font_data.insert(
+                "segoe_ui_symbol".to_owned(),
+                egui::FontData::from_owned(bytes),
+            );
+            fonts
+                .families
+                .entry(egui::FontFamily::Proportional)
+                .or_default()
+                .push("segoe_ui_symbol".to_owned());
+            fonts
+                .families
+                .entry(egui::FontFamily::Monospace)
+                .or_default()
+                .push("segoe_ui_symbol".to_owned());
         }
     }
 
