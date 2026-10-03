@@ -1746,6 +1746,9 @@ fn create_tray() -> (
     (tray_icon, Some(open_id), Some(force_id), Some(exit_id))
 }
 
+const VICTOR_MONO_NERD: &[u8] =
+    include_bytes!("../../assets/fonts/VictorMonoNerdFont-Regular.ttf");
+
 fn apply_winui3_theme(ctx: &egui::Context) {
     let mut visuals = egui::Visuals::dark();
 
@@ -1782,12 +1785,17 @@ fn apply_winui3_theme(ctx: &egui::Context) {
 
     ctx.set_visuals(visuals);
 
-    // Load Segoe UI at runtime (Windows only) so:
-    //   1. Compilation works on non-Windows hosts.
-    //   2. The font is NOT baked into the binary (keeps binary smaller).
-    //   3. If the font is missing, egui silently falls back to its built-in font.
     let mut fonts = egui::FontDefinitions::default();
 
+    // ── Embed Victor Mono Nerd Font diretamente no executável ───────────────
+    // Garante que todos os glifos, símbolos, ícones Nerd Font e ligaduras
+    // funcionem perfeitamente em qualquer computador, sem depender de fontes locais.
+    fonts.font_data.insert(
+        "victor_mono_nerd".to_owned(),
+        egui::FontData::from_static(VICTOR_MONO_NERD),
+    );
+
+    // Texto Proporcional padrão: Segoe UI (se disponível no Windows)
     #[cfg(target_os = "windows")]
     {
         let font_path = std::path::Path::new(r"C:\Windows\Fonts\segoeui.ttf");
@@ -1802,25 +1810,21 @@ fn apply_winui3_theme(ctx: &egui::Context) {
                 .or_default()
                 .insert(0, "segoe_ui".to_owned());
         }
-
-        let symbol_path = std::path::Path::new(r"C:\Windows\Fonts\seguisym.ttf");
-        if let Ok(bytes) = std::fs::read(symbol_path) {
-            fonts.font_data.insert(
-                "segoe_ui_symbol".to_owned(),
-                egui::FontData::from_owned(bytes),
-            );
-            fonts
-                .families
-                .entry(egui::FontFamily::Proportional)
-                .or_default()
-                .push("segoe_ui_symbol".to_owned());
-            fonts
-                .families
-                .entry(egui::FontFamily::Monospace)
-                .or_default()
-                .push("segoe_ui_symbol".to_owned());
-        }
     }
+
+    // Adiciona Victor Mono Nerd Font como fallback primário de Proportional para símbolos e ícones
+    fonts
+        .families
+        .entry(egui::FontFamily::Proportional)
+        .or_default()
+        .push("victor_mono_nerd".to_owned());
+
+    // Define Victor Mono Nerd Font como fonte primária para Monospace (IPs, tokens, históricos)
+    fonts
+        .families
+        .entry(egui::FontFamily::Monospace)
+        .or_default()
+        .insert(0, "victor_mono_nerd".to_owned());
 
     ctx.set_fonts(fonts);
 }

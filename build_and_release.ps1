@@ -31,7 +31,7 @@ if (-not (Test-Path $outputBinary)) {
 
 # 3. Publicacao no Git (lpl2103/duckdns-updater)
 Write-Host "[*] Enviando alteracoes para git (lpl2103/duckdns-updater)..." -ForegroundColor Cyan
-git add Cargo.toml Cargo.lock duckdns-updater.exe dist/duckdns-updater.exe src/ build.rs README.md GEMINI.md AGENTS.md build_and_verify.ps1 build_and_release.ps1 .gitignore
+git add Cargo.toml Cargo.lock duckdns-updater.exe dist/duckdns-updater.exe src/ assets/ build.rs README.md GEMINI.md AGENTS.md build_and_verify.ps1 build_and_release.ps1 .gitignore
 git commit -m "release: v$version - $Notes"
 git push origin master
 git tag -a "v$version" -m "Release v$version"
